@@ -1,0 +1,205 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/"  
+local fpsTarget = 5
+local frameDuration = 1 / fpsTarget
+
+-- Function to construct movie URLs
+function getMovieURL(movieName, index)
+    return baseURL .. movieName .. "/video_part_" .. index .. ".nfv"
+end
+
+function downloadVideo(movieName, index)
+    local fileName = "/" .. movieName .. "_part_" .. index .. ".nfv"
+    local url = getMovieURL(movieName, index)
+
+    print("Downloading: " .. url)
+    local result = shell.run("wget " .. url .. " " .. fileName)
+    if result then
+        print("Download complete: " .. fileName)
+        return fileName
+    else
+        print("Failed to download: " .. fileName)
+        return nil
+    end
+end
+
+function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    local fps = tonumber(videoData[1]:match("%d+ %d+ (%d+)"))
+    table.remove(videoData, 1)
+
+    return videoData, resolution, fps
+end
+
+function nextFrame(videoData, resolution, frameIndex)
+    if frameIndex > #videoData then
+        return false, frameIndex
+    end
+
+    local frame = {}
+    for i = 1, resolution[2] do
+        if frameIndex > #videoData then
+            break
+        end
+        table.insert(frame, videoData[frameIndex])
+        frameIndex = frameIndex + 1
+    end
+
+    local parsedFrame = paintutils.parseImage(table.concat(frame, "\n"))
+    paintutils.drawImage(parsedFrame, 1, 1)
+
+    local startTime = os.clock()
+    while (os.clock() - startTime) < frameDuration do
+        os.sleep(0.01)
+    end
+
+    return true, frameIndex
+end
+
+function playVideo(videoFile)
+    local videoData, resolution = loadVideo(videoFile)
+    local frameIndex = 2
+
+    while true do
+        local success
+        success, frameIndex = nextFrame(videoData, resolution, frameIndex)
+        if not success then return end
+    end
+end
+
+-- Function to find a Computronics cassette in the chest
+function findCassette(movieName)
+    if not chest then
+        print("Error: Chest not found!")
+        return nil
+    end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then  -- Checks for Computronics tapes
+            print("Found tape in slot " .. slot)
+            return slot
+        end
+    end
+
+    print("No cassette found in chest!")
+    return nil
+end
+
+-- Function to insert the correct tape into the drive
+function insertTape(movieName)
+    if not tapeDrive then
+        print("Error: Tape Drive not found!")
+        return false
+    end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then  -- Ensure it's a Computronics tape
+            print("Pulling tape from slot " .. slot .. " into tape drive...")
+            chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+            os.sleep(1)  -- Wait for tape to insert
+
+            -- Check if tape is inserted and read its label
+            if tapeDrive.getItemDetail then
+                local tapeInfo = tapeDrive.getItemDetail()
+                if tapeInfo and tapeInfo.displayName then
+                    local label = tapeInfo.displayName:lower()
+
+                    -- If tape matches, return success
+                    if label == movieName:lower() then
+                        print("Correct tape inserted: " .. tapeInfo.displayName)
+                        return true
+                    else
+                        print("Incorrect tape: " .. tapeInfo.displayName .. " | Ejecting...")
+                        tapeDrive.eject()
+                        os.sleep(1)  -- Wait before trying next tape
+                    end
+                end
+            end
+        end
+    end
+
+    print("No matching cassette found for " .. movieName)
+    return false
+end
+
+function ejectTape()
+    if tapeDrive and tapeDrive.getItemDetail and tapeDrive.getItemDetail() then
+        print("Ejecting cassette...")
+        tapeDrive.eject()
+        os.sleep(1)
+    else
+        print("No cassette in drive.")
+    end
+end
+
+function playMovie(movieName)
+    local videoIndex = 1
+    local allVideosPlayed = false
+
+    if insertTape(movieName) then
+        os.sleep(1)
+        tapeDrive.play()
+        print("Playing cassette for " .. movieName .. "...")
+
+        while not allVideosPlayed do
+            local currentFile = downloadVideo(movieName, videoIndex)
+            if not currentFile then
+                print("No more video parts found. Stopping playback.")
+                allVideosPlayed = true
+                break
+            end
+
+            local nextIndex = videoIndex + 1
+            local nextFileName = "/" .. movieName .. "_part_" .. nextIndex .. ".nfv"
+            shell.run("wget " .. getMovieURL(movieName, nextIndex) .. " " .. nextFileName .. " &")
+
+            playVideo(currentFile)
+
+            fs.delete(currentFile)
+
+            if fs.exists(nextFileName) then
+                videoIndex = nextIndex
+            else
+                print("No more video parts found. Stopping playback.")
+                allVideosPlayed = true
+            end
+        end
+
+        tapeDrive.stop()
+        ejectTape()
+    else
+        print("Cassette could not be inserted. Aborting playback.")
+    end
+end
+
+monitor.setTextScale(1)
+term.redirect(monitor)
+
+modem.open(100)
+
+print("Waiting for movie selection...")
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        print("Starting movie: " .. movieName)
+        playMovie(movieName)
+    end
+end
