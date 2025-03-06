@@ -1,0 +1,225 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest")  -- Auto-detects chest/barrel
+local tapeDrive = peripheral.find("tape_drive")
+
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/"  -- Placeholder, update per movie
+local fpsTarget = 5
+local frameDuration = 1 / fpsTarget
+
+-- Forward declare functions
+local findCassette, insertTape, ejectTape, playMovie, getMovieURL, downloadVideo, playVideo, loadVideo, nextFrame
+
+-- Function to construct movie URLs
+function getMovieURL(movieName, index)
+    return baseURL .. movieName .. "/video_part_" .. index .. ".nfv"
+end
+
+-- Function to download a video file
+function downloadVideo(movieName, index)
+    local fileName = "/" .. movieName .. "_part_" .. index .. ".nfv"
+    local url = getMovieURL(movieName, index)
+
+    print("Downloading: " .. url)
+    local result = shell.run("wget " .. url .. " " .. fileName)
+    if result then
+        print("Download complete: " .. fileName)
+        return fileName
+    else
+        print("Failed to download: " .. fileName)
+        return nil
+    end
+end
+
+-- Function to load video data
+function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    local fps = tonumber(videoData[1]:match("%d+ %d+ (%d+)"))
+    table.remove(videoData, 1)
+
+    return videoData, resolution, fps
+end
+
+-- Function to display the next frame at 5 FPS
+function nextFrame(videoData, resolution, frameIndex)
+    if frameIndex > #videoData then
+        return false, frameIndex
+    end
+
+    local frame = {}
+    for i = 1, resolution[2] do
+        if frameIndex > #videoData then
+            break
+        end
+        table.insert(frame, videoData[frameIndex])
+        frameIndex = frameIndex + 1
+    end
+
+    local parsedFrame = paintutils.parseImage(table.concat(frame, "\n"))
+    paintutils.drawImage(parsedFrame, 1, 1)
+
+    local startTime = os.clock()
+    while (os.clock() - startTime) < frameDuration do
+        os.sleep(0.01)
+    end
+
+    return true, frameIndex
+end
+
+-- Function to play the video file
+function playVideo(videoFile)
+    local videoData, resolution = loadVideo(videoFile)
+    local frameIndex = 2
+
+    while true do
+        local success
+        success, frameIndex = nextFrame(videoData, resolution, frameIndex)
+        if not success then return end
+    end
+end
+
+-- Function to find and retrieve the correct cassette in the chest
+function findCassette(movieName)
+    if not chest then
+        print("Error: Chest not found!")
+        return nil, nil
+    end
+
+    if not chest.getItemDetail then
+        print("Error: Chest does not support getItemDetail()")
+        return nil, nil
+    end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        local meta = chest.getItemDetail(slot)  -- Get full item details safely
+
+        if meta and meta.displayName then
+            local label = meta.displayName:lower()  -- Normalize casing
+            if label == movieName:lower() then
+                print("Found cassette: " .. meta.displayName .. " in slot " .. slot)
+                return slot, item
+            end
+        end
+    end
+
+    print("Cassette not found for " .. movieName)
+    return nil, nil
+end
+
+
+
+-- Function to insert the cassette tape into the tape drive
+function insertTape(movieName)
+    if not tapeDrive then
+        print("Error: Tape Drive not found!")
+        return false
+    end
+
+    -- Eject any existing tape before inserting
+    if tapeDrive.getItemDetail and tapeDrive.getItemDetail() then
+        print("Ejecting existing tape...")
+        tapeDrive.eject()
+        os.sleep(1)
+    end
+
+    -- Locate the correct cassette in the chest
+    local slot, item = findCassette(movieName)
+    if not slot then return false end
+
+    -- Move cassette from chest to tape drive
+    chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+    os.sleep(1)  -- Wait for tape to insert properly
+
+    -- Ensure tape is rewound before playing
+    if tapeDrive.getPosition and tapeDrive.getPosition() > 0 then
+        print("Rewinding tape...")
+        tapeDrive.seek(-tapeDrive.getSize())
+        os.sleep(1)
+    end
+
+    return true
+end
+
+-- Function to eject the cassette tape
+function ejectTape()
+    if tapeDrive and tapeDrive.getItemDetail and tapeDrive.getItemDetail() then
+        print("Ejecting cassette...")
+        tapeDrive.eject()
+        os.sleep(1)
+    else
+        print("No cassette in drive.")
+    end
+end
+
+-- Function to play a selected movie
+function playMovie(movieName)
+    local videoIndex = 1
+    local allVideosPlayed = false
+
+    -- Insert and start playing the tape
+    if insertTape(movieName) then
+        os.sleep(1)
+        tapeDrive.play()
+        print("Playing cassette for " .. movieName .. "...")
+
+        while not allVideosPlayed do
+            -- Download the current video part
+            local currentFile = downloadVideo(movieName, videoIndex)
+            if not currentFile then
+                print("No more video parts found. Stopping playback.")
+                allVideosPlayed = true
+                break
+            end
+
+            -- Start downloading the next video while playing
+            local nextIndex = videoIndex + 1
+            local nextFileName = "/" .. movieName .. "_part_" .. nextIndex .. ".nfv"
+            shell.run("wget " .. getMovieURL(movieName, nextIndex) .. " " .. nextFileName .. " &")
+
+            -- Play the current video
+            playVideo(currentFile)
+
+            -- Delete the played video
+            fs.delete(currentFile)
+
+            -- Check if next part exists
+            if fs.exists(nextFileName) then
+                videoIndex = nextIndex
+            else
+                print("No more video parts found. Stopping playback.")
+                allVideosPlayed = true
+            end
+        end
+
+        -- Stop and eject the tape
+        tapeDrive.stop()
+        ejectTape()
+    else
+        print("Cassette could not be inserted. Aborting playback.")
+    end
+end
+
+-- Set up the monitor
+monitor.setTextScale(1)
+term.redirect(monitor)
+
+-- Open modem for listening
+modem.open(100)
+
+print("Waiting for movie selection...")
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        print("Starting movie: " .. movieName)
+        playMovie(movieName)
+    end
+end
