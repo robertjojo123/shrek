@@ -1,0 +1,208 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+
+if not monitor then
+    error("Error: Monitor not found! Make sure a monitor is connected.", 0)
+end
+
+monitor.setTextScale(0.5)
+monitor.setBackgroundColor(colors.black)
+monitor.clear()
+term.redirect(monitor)
+
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+-- Base URL for movie files
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/video_part_"
+local fpsTarget = 5
+local frameDuration = 1 / fpsTarget -- 0.2 seconds per frame
+
+function getMovieURL(index)
+    return baseURL .. index .. ".nfv"
+end
+
+function clearOldVideos()
+    fs.delete("/current_video.nfv")
+    fs.delete("/next_video.nfv")
+end
+
+function downloadVideo(index)
+    local url = getMovieURL(index)
+    local localFile = "/current_video.nfv"
+    shell.run("wget", url, localFile)
+    return fs.exists(localFile) and localFile or nil
+end
+
+function loadVideo(videoFile)
+    if not fs.exists(videoFile) then 
+        print("Error: Video file not found:", videoFile)
+        return nil, nil 
+    end
+
+    local videoData = {}
+    local width, height
+
+    local file = fs.open(videoFile, "r")
+    if file then
+        local firstLine = file.readLine()
+        width, height = firstLine:match("(%d+) (%d+)")
+        width, height = tonumber(width), tonumber(height)
+
+        for line in file.readAll():gmatch("[^\r\n]+") do
+            table.insert(videoData, line)
+        end
+        file.close()
+    else
+        return nil, nil
+    end
+
+    if not width or not height or #videoData == 0 then
+        return nil, nil -- Prevents empty data from breaking playback
+    end
+
+    return videoData, { width, height }
+end
+
+function nextFrame(videoData, resolution, frameIndex)
+    if frameIndex > #videoData then return false, frameIndex end
+
+    local frame = {}
+    for i = 1, resolution[2] do
+        if frameIndex > #videoData then break end
+        table.insert(frame, videoData[frameIndex])
+        frameIndex = frameIndex + 1
+    end
+
+    local imageString = table.concat(frame, "\n")
+    local parsedFrame = paintutils.parseImage(imageString)
+
+    if parsedFrame then
+        paintutils.drawImage(parsedFrame, 1, 1)
+    else
+        print("Warning: Frame could not be parsed.") -- Debugging step
+    end
+
+    return true, frameIndex
+end
+
+function playVideo(videoFile)
+    local videoData, resolution = loadVideo(videoFile)
+    if not videoData or not resolution then 
+        print("Error: Video data missing or corrupted.") -- Debugging step
+        return 
+    end
+
+    -- Clear screen before playing
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    local frameIndex = 1
+    local startTime = os.clock()
+
+    while frameIndex <= #videoData do
+        local targetTime = startTime + (frameIndex * frameDuration)
+
+        local success
+        success, frameIndex = nextFrame(videoData, resolution, frameIndex)
+
+        if not success then return end
+
+        while os.clock() < targetTime do
+            os.sleep(0.001)
+        end
+    end
+end
+
+function correctTapeInserted(movieName)
+    if tapeDrive and tapeDrive.getLabel then
+        local label = tapeDrive.getLabel()
+        return label and label:lower() == movieName:lower()
+    end
+    return false
+end
+
+function insertTape(movieName)
+    if not tapeDrive then return false end
+    if correctTapeInserted(movieName) then return true end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then
+            chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+            os.sleep(1)
+            if correctTapeInserted(movieName) then return true end
+            tapeDrive.eject()
+            os.sleep(1)
+        end
+    end
+    return false
+end
+
+function rewindTape()
+    if tapeDrive and tapeDrive.getSize and tapeDrive.getPosition then
+        if tapeDrive.getPosition() > 0 then
+            tapeDrive.seek(-tapeDrive.getSize())
+            os.sleep(2)
+        end
+    end
+end
+
+function ejectTape()
+    if tapeDrive and tapeDrive.getLabel then
+        tapeDrive.eject()
+        os.sleep(1)
+    end
+end
+
+function playMovie(movieName)
+    clearOldVideos()
+    local videoIndex = 1
+
+    if insertTape(movieName) then
+        rewindTape()
+        os.sleep(1)
+        tapeDrive.play()
+
+        while true do
+            local currentFile = downloadVideo(videoIndex)
+            if not currentFile then 
+                print("Error: Failed to download video part", videoIndex)
+                break 
+            end
+
+            local nextIndex = videoIndex + 1
+            local nextFile = "/next_video.nfv"
+            shell.run("wget", getMovieURL(nextIndex), nextFile, "&")
+
+            print("Playing video part", videoIndex) -- Debugging step
+            playVideo(currentFile)
+
+            fs.delete(currentFile)
+
+            if fs.exists(nextFile) then
+                fs.move(nextFile, "/current_video.nfv")
+                videoIndex = nextIndex
+            else
+                break
+            end
+        end
+
+        tapeDrive.stop()
+        ejectTape()
+    end
+end
+
+modem.open(100)
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        playMovie(movieName)
+    end
+end
