@@ -1,0 +1,181 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+-- Base URL for movie files
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/video_part_"
+local fpsTarget = 5
+local frameDuration = 1 / fpsTarget -- 0.2 seconds per frame
+
+-- Function to construct the correct video URL
+function getMovieURL(index)
+    return baseURL .. index .. ".nfv"
+end
+
+-- Function to clean up any old files before starting fresh
+function clearOldVideos()
+    fs.delete("/current_video.nfv")
+    fs.delete("/next_video.nfv")
+end
+
+-- Function to download a video file and save it locally
+function downloadVideo(index)
+    local url = getMovieURL(index)
+    local localFile = "/current_video.nfv"
+
+    shell.run("wget", url, localFile)
+    return fs.exists(localFile) and localFile or nil
+end
+
+-- Function to load video data from a file
+function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    table.remove(videoData, 1)
+    return videoData, resolution
+end
+
+-- Function to display the next frame while maintaining exact 5 FPS timing
+function nextFrame(videoData, resolution, frameIndex)
+    if frameIndex > #videoData then return false, frameIndex end
+
+    local startTime = os.clock() -- Track frame start time
+
+    local frame = {}
+    for i = 1, resolution[2] do
+        if frameIndex > #videoData then break end
+        table.insert(frame, videoData[frameIndex])
+        frameIndex = frameIndex + 1
+    end
+
+    local parsedFrame = paintutils.parseImage(table.concat(frame, "\n"))
+    paintutils.drawImage(parsedFrame, 1, 1)
+
+    -- Enforce precise 5 FPS timing
+    local elapsedTime = os.clock() - startTime
+    local remainingTime = frameDuration - elapsedTime
+    if remainingTime > 0 then
+        os.sleep(remainingTime)
+    end
+
+    return true, frameIndex
+end
+
+-- Function to play a video at exactly 5 FPS
+function playVideo(videoFile)
+    local videoData, resolution = loadVideo(videoFile)
+    local frameIndex = 2
+
+    while true do
+        local success
+        success, frameIndex = nextFrame(videoData, resolution, frameIndex)
+        if not success then return end
+    end
+end
+
+-- Function to check if the correct tape is already in the drive
+function correctTapeInserted(movieName)
+    if tapeDrive and tapeDrive.getLabel then
+        local label = tapeDrive.getLabel()
+        return label and label:lower() == movieName:lower()
+    end
+    return false
+end
+
+-- Function to insert the correct tape into the drive
+function insertTape(movieName)
+    if not tapeDrive then return false end
+
+    if correctTapeInserted(movieName) then return true end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then
+            chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+            os.sleep(1)
+
+            if correctTapeInserted(movieName) then
+                return true
+            else
+                tapeDrive.eject()
+                os.sleep(1)
+            end
+        end
+    end
+    return false
+end
+
+-- Function to rewind the tape before playback
+function rewindTape()
+    if tapeDrive and tapeDrive.getSize and tapeDrive.getPosition then
+        if tapeDrive.getPosition() > 0 then
+            tapeDrive.seek(-tapeDrive.getSize())
+            os.sleep(2)
+        end
+    end
+end
+
+-- Function to eject the tape after playback
+function ejectTape()
+    if tapeDrive and tapeDrive.getLabel then
+        tapeDrive.eject()
+        os.sleep(1)
+    end
+end
+
+-- Function to play the full movie with perfect synchronization
+function playMovie(movieName)
+    clearOldVideos() -- Ensure no previous files remain
+    local videoIndex = 1 -- Start from the beginning
+
+    if insertTape(movieName) then
+        rewindTape() -- Ensure the tape is rewound before playback
+        os.sleep(1)
+        tapeDrive.play()
+
+        while true do
+            local currentFile = downloadVideo(videoIndex)
+            if not currentFile then break end
+
+            -- Preload the next video part in the background
+            local nextIndex = videoIndex + 1
+            local nextFile = "/next_video.nfv"
+            shell.run("wget", getMovieURL(nextIndex), nextFile, "&")
+
+            playVideo(currentFile)
+            fs.delete(currentFile)
+
+            if fs.exists(nextFile) then
+                fs.move(nextFile, "/current_video.nfv")
+                videoIndex = nextIndex
+            else
+                break
+            end
+        end
+
+        tapeDrive.stop()
+        ejectTape()
+    end
+end
+
+-- Setup the monitor and modem
+monitor.setTextScale(1)
+term.redirect(monitor)
+modem.open(100)
+
+-- Wait for movie selection
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        playMovie(movieName)
+    end
+end
