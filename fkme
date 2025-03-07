@@ -1,0 +1,165 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+-- Base URL for movie files
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/video_part_"
+local bytesPerFrame = 1200  -- 1 frame per 1200 bytes on tape
+local firstVideoDuration = 38000  -- First video should last exactly 38,000 ms
+local otherVideoDuration = 45000  -- Every other video should last 45,000 ms
+
+-- === SURFACE API (From CrazedProgrammer) ===
+local function loadAPIString(name, str)
+    local env = {}
+    setmetatable(env, {__index = _G})
+    local fn, err = loadstring(str, name)
+    if fn then
+        setfenv(fn, env)
+        local ok, err = pcall(fn)
+        if not ok then error(err) end
+    else
+        error(err)
+    end
+    local api = {}
+    for k, v in pairs(env) do
+        if k ~= "_ENV" then api[k] = v end
+    end
+    return api
+end
+
+local surface = loadAPIString("surface", [[
+    version="1.6.2"
+    local a,b,c,d,e=math.floor,math.cos,math.sin,table.concat,{
+    [1]="0",[2]="1",[4]="2",[8]="3",[16]="4",[32]="5",[64]="6",
+    [128]="7",[256]="8",[512]="9",[1024]="a",[2048]="b",[4096]="c",
+    [8192]="d",[16384]="e",[32768]="f"}
+
+    local f={render=function(g,h,i,j,k,l,m,n)
+        h,i,j,k,l,m,n=h or term,i or 1,j or 1,k or 1,l or 1,m or g.width,n or g.height
+        if k>m then local o=k;k,m=m,o end
+        if l>n then local o=l;l,n=n,o end
+        if m<1 or k>g.width or n<1 or l>g.height then return end
+        if k<1 then k=1 end
+        if m>g.width then m=g.width end
+        if l<1 then l=1 end
+        if n>g.height then n=g.height end
+        local p={}
+
+        if h.blit then
+            local q,r,s={}, {}, {}
+            for t=l,n do for u=k,m do
+                q[u-k+1]=g.buffer[((t-1)*g.width+u)*3-2]or" "
+                r[u-k+1]=e[g.buffer[((t-1)*g.width+u)*3-1]or 32768]
+                s[u-k+1]=e[g.buffer[((t-1)*g.width+u)*3]or 1]
+            end
+            p[#p+1]=j+t-l
+            p[#p+1]=d(q)
+            p[#p+1]=d(s)
+            p[#p+1]=d(r)
+            end
+            for u=1,#p,4 do h.setCursorPos(i,p[u])h.blit(p[u+1],p[u+2],p[u+3])end
+        end
+    end}
+
+    function create(I,J,B,v,w)
+        local g={}
+        for K,L in pairs(f) do g[K]=L end
+        g.width,g.height,g.buffer=I,J,{}
+        for u=1,I*J do g.buffer[u*3-2]=B end
+        return g
+    end
+]])
+
+if not surface.create then
+    error("Error: surface API failed to load properly!")
+end
+-- === END OF SURFACE API ===
+
+local function getMovieURL(index)
+    return baseURL .. index .. ".nfv"
+end
+
+local function clearOldVideos()
+    fs.delete("/current_video.nfv")
+    fs.delete("/next_video.nfv")
+end
+
+local function downloadVideo(index)
+    local url = getMovieURL(index)
+    local localFile = "/current_video.nfv"
+    shell.run("wget", url, localFile)
+    return fs.exists(localFile) and localFile or nil
+end
+
+local function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    table.remove(videoData, 1) -- Remove resolution header
+    return videoData, resolution
+end
+
+local function convertHexFrameToSurface(frameData, width, height)
+    local surf = surface.create(width, height, " ", colors.black, colors.black)
+    for y, line in ipairs(frameData) do
+        for x = 1, #line do
+            local hex = tonumber(line:sub(x, x), 16)
+            local color = 2 ^ hex
+            surf.buffer[((y - 1) * width + x) * 3 - 1] = color -- Foreground
+            surf.buffer[((y - 1) * width + x) * 3] = color     -- Background
+        end
+    end
+    return surf
+end
+
+local function playVideo(videoFile, videoIndex, startTime)
+    local videoData, resolution = loadVideo(videoFile)
+    local totalFrames = math.floor(#videoData / resolution[2])
+    local frameIndex = (videoIndex == 1) and 1401 or 1
+    local videoStartTime = os.epoch("utc") - startTime
+
+    local surf = surface.create(resolution[1], resolution[2], " ", colors.black, colors.black)
+    while frameIndex <= totalFrames do
+        local bytePosition = tapeDrive.getPosition()
+        local elapsedTime = os.epoch("utc") - videoStartTime
+        local expectedFrame = math.floor(bytePosition / bytesPerFrame) + 1
+
+        if expectedFrame > totalFrames then break end
+        frameIndex = expectedFrame
+
+        local frame = {}
+        for i = 1, resolution[2] do
+            if frameIndex * resolution[2] + i - resolution[2] > #videoData then break end
+            table.insert(frame, videoData[frameIndex * resolution[2] + i - resolution[2]])
+        end
+
+        surf = convertHexFrameToSurface(frame, resolution[1], resolution[2])
+        surf:render()
+
+        local frameTimestamp = startTime + ((frameIndex - 1) * 200)
+        local sleepTime = (frameTimestamp - os.epoch("utc")) / 1000
+        if sleepTime > 0 then os.sleep(sleepTime) end
+
+        os.queueEvent("frame")
+        os.pullEvent("frame")
+    end
+end
+
+monitor.setTextScale(1)
+term.redirect(monitor)
+modem.open(100)
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        playVideo(movieName, 1, os.epoch("utc"))
+    end
+end
