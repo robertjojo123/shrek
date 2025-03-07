@@ -61,45 +61,48 @@ function playVideo(videoFile, globalStartTime, videoIndex)
     -- Calculate the exact end time for this video
     local videoEndTime = globalStartTime + videoDuration
 
-    while os.epoch("utc") < videoEndTime do
-        -- Yield to prevent "too long without yielding" error
-        os.queueEvent("yield")
-        os.pullEvent("yield")
+    -- Function to draw frames in sync with time
+    function nextFrame()
+        local start = os.epoch("utc")
 
-        local currentTime = os.epoch("utc")
-        local elapsedTime = currentTime - globalStartTime
+        -- Draw frame
+        local frame = {}
+        for i = 1, resolution[2] do
+            if frameIndex + i > #videoData then
+                break
+            end
+            table.insert(frame, videoData[frameIndex + i])
+        end
+        frame = paintutils.parseImage(table.concat(frame, "\n"))
+        frameIndex = frameIndex + resolution[2]
 
-        -- Determine the expected frame index based on elapsed time
-        local expectedFrame = math.floor(elapsedTime / frameInterval) * linesPerFrame
-        if expectedFrame > frameIndex then
-            frameIndex = alignFrameIndex(expectedFrame) -- Skip ahead if needed
+        -- Stop playing if past the last frame
+        if frameIndex > #videoData then
+            return false
         end
 
-        -- Prepare and draw the frame
-        if frameIndex <= #videoData then
-            local frame = {}
-            for i = 1, resolution[2] do
-                if frameIndex > #videoData then break end
-                table.insert(frame, videoData[frameIndex])
-                frameIndex = frameIndex + 1
-            end
+        paintutils.drawImage(frame, 1, 1)
 
-            if #frame > 0 then
-                local parsedFrame = paintutils.parseImage(table.concat(frame, "\n"))
-                paintutils.drawImage(parsedFrame, 1, 1)
-            end
-        end
+        -- Calculate how much time we took to draw
+        local drawTime = os.epoch("utc") - start
 
-        -- Calculate sleep time to align with the next expected frame
-        local nextFrameTime = globalStartTime + ((frameIndex - 1) / linesPerFrame) * frameInterval
-        local sleepTime = (nextFrameTime - os.epoch("utc")) / 1000
-
-        -- Reduce wait time if behind schedule, otherwise wait exactly
+        -- Adjust sleep time to maintain perfect sync
+        local sleepTime = (frameInterval - drawTime) / 1000
         if sleepTime > 0 then
             os.sleep(sleepTime)
         end
+
+        return true
+    end
+
+    -- Run frames in a loop until the video's duration ends
+    while os.epoch("utc") < videoEndTime do
+        if not nextFrame() then
+            break
+        end
     end
 end
+
 
 function correctTapeInserted(movieName)
     if tapeDrive and tapeDrive.getLabel then
