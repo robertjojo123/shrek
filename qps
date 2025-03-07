@@ -1,0 +1,219 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/video_part_"
+
+local firstVideoDuration = 38000  -- 38s
+local otherVideoDuration = 45000  -- 45s
+local frameInterval = 200          -- 200ms per frame
+local linesPerFrame = 40           -- Each frame consists of 40 lines
+local globalElapsedTime = 0        -- Stores total time since audio started
+
+function getMovieURL(index)
+    return baseURL .. index .. ".nfv"
+end
+
+function clearOldVideos()
+    fs.delete("/current_video.nfv")
+    fs.delete("/next_video.nfv")
+end
+
+function downloadVideo(index)
+    local url = getMovieURL(index)
+    local localFile = "/current_video.nfv"
+
+    local downloadStart = os.epoch("utc")
+    shell.run("wget", url, localFile)
+    local downloadEnd = os.epoch("utc")
+
+    return fs.exists(localFile) and localFile or nil, (downloadEnd - downloadStart)
+end
+
+function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    table.remove(videoData, 1)
+    return videoData, resolution
+end
+
+function playVideo(videoFile, videoStartTime, videoIndex)
+    local videoData, resolution = loadVideo(videoFile)
+    local frameIndex = 1
+    local videoEndTime = videoStartTime + (videoIndex == 1 and firstVideoDuration or otherVideoDuration)
+    local frameStartTime = os.epoch("utc")
+
+    -- Synchronization Correction for Delayed Video Start
+    local expectedOffset = globalElapsedTime - (videoIndex == 1 and 0 or (firstVideoDuration + ((videoIndex - 2) * otherVideoDuration)))
+    local frameCorrection = math.floor(expectedOffset / frameInterval)
+
+    frameIndex = frameIndex + (frameCorrection * linesPerFrame)
+
+    function nextFrame()
+        local currentTime = os.epoch("utc")
+        local elapsedTime = currentTime - videoStartTime
+        local expectedFrame = math.floor(elapsedTime / frameInterval) * linesPerFrame
+
+        if expectedFrame > frameIndex then
+            frameIndex = expectedFrame
+        end
+
+        local frame = {}
+        for i = 1, resolution[2] do
+            if frameIndex + i > #videoData then
+                break
+            end
+            table.insert(frame, videoData[frameIndex + i])
+        end
+        frame = paintutils.parseImage(table.concat(frame, "\n"))
+        frameIndex = frameIndex + resolution[2]
+
+        if frameIndex > #videoData then
+            return false
+        end
+
+        paintutils.drawImage(frame, 1, 1)
+
+        local elapsedFrameTime = os.epoch("utc") - frameStartTime
+        frameStartTime = os.epoch("utc")
+
+        local sleepTime = (frameInterval - elapsedFrameTime) / 1000
+        if sleepTime < 0 then
+            sleepTime = 0
+        end
+
+        os.sleep(sleepTime)
+        return true
+    end
+
+    while os.epoch("utc") < videoEndTime do
+        if not nextFrame() then
+            break
+        end
+    end
+end
+
+function trackElapsedTime(globalStartTime)
+    while true do
+        globalElapsedTime = os.epoch("utc") - globalStartTime
+        os.sleep(0.1)
+    end
+end
+
+function correctTapeInserted(movieName)
+    if tapeDrive and tapeDrive.getLabel then
+        local label = tapeDrive.getLabel()
+        return label and label:lower() == movieName:lower()
+    end
+    return false
+end
+
+function insertTape(movieName)
+    if not tapeDrive then return false end
+    if correctTapeInserted(movieName) then return true end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then
+            chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+            os.sleep(1)
+
+            if correctTapeInserted(movieName) then
+                return true
+            else
+                tapeDrive.eject()
+                os.sleep(1)
+            end
+        end
+    end
+    return false
+end
+
+function rewindTape()
+    if tapeDrive and tapeDrive.getSize and tapeDrive.getPosition then
+        if tapeDrive.getPosition() > 0 then
+            tapeDrive.stop()  -- Stop tape before rewinding
+            os.sleep(0.5)  -- Short delay to ensure stop takes effect
+            tapeDrive.seek(-tapeDrive.getSize())
+            os.sleep(2)
+        end
+    end
+end
+
+function ejectTape()
+    if tapeDrive and tapeDrive.getLabel then
+        tapeDrive.eject()
+        os.sleep(1)
+    end
+end
+
+function playMovie(movieName)
+    clearOldVideos()
+    local videoIndex = 1
+    local globalStartTime = nil
+    local videoStartTime = nil
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    if insertTape(movieName) then
+        rewindTape()
+        os.sleep(1)
+
+        tapeDrive.play()
+        globalStartTime = os.epoch("utc")
+
+        os.sleep(0.75) -- **750ms delay before first video starts**
+        videoStartTime = os.epoch("utc")
+
+        parallel.waitForAny(
+            function()
+                while true do
+                    local currentFile, downloadTime = downloadVideo(videoIndex)
+                    if not currentFile then break end
+
+                    local nextIndex = videoIndex + 1
+                    local nextFile = "/next_video.nfv"
+                    shell.run("wget", getMovieURL(nextIndex), nextFile, "&")
+
+                    playVideo(currentFile, videoStartTime, videoIndex)
+                    fs.delete(currentFile)
+
+                    if fs.exists(nextFile) then
+                        fs.move(nextFile, "/current_video.nfv")
+                        videoIndex = nextIndex
+                        videoStartTime = globalStartTime + firstVideoDuration + ((videoIndex - 2) * otherVideoDuration)
+                    else
+                        break
+                    end
+                end
+
+                tapeDrive.stop()
+                ejectTape()
+            end,
+            function()
+                trackElapsedTime(globalStartTime)
+            end
+        )
+    end
+end
+
+monitor.setTextScale(1)
+term.redirect(monitor)
+modem.open(100)
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        playMovie(movieName)
+    end
+end
