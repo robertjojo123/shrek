@@ -1,0 +1,202 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+local chest = peripheral.find("minecraft:chest") or peripheral.find("minecraft:barrel") or peripheral.find("ironchest:iron_chest")
+local tapeDrive = peripheral.find("tape_drive")
+
+if not chest then
+    error("Error: Chest not found! Check peripheral name.", 0)
+end
+
+-- Base URL for movie files
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shrek/refs/heads/main/video_part_"
+local bytesPerFrame = 1200  -- 1 frame per 1200 bytes on tape
+local firstVideoDuration = 38000  -- First video should last exactly 38,000 ms
+local otherVideoDuration = 45000  -- Every other video should last 45,000 ms
+
+-- Load CrazedProgrammer's surface API
+local function loadAPIString(name, str)
+    local env = {}
+    setmetatable(env, { __index = _G })
+    local fn, err = loadstring(str, name)
+    if fn then
+        setfenv(fn, env)
+        local ok, err = pcall(fn)
+        if not ok then error(err) end
+    else
+        error(err)
+    end
+    local api = {}
+    for k, v in pairs(env) do
+        if k ~= "_ENV" then api[k] = v end
+    end
+    return api
+end
+
+local surface = loadAPIString("surface", [[
+    -- Insert surface API code here from CrazedProgrammer's script
+]])
+
+local function getMovieURL(index)
+    return baseURL .. index .. ".nfv"
+end
+
+local function clearOldVideos()
+    fs.delete("/current_video.nfv")
+    fs.delete("/next_video.nfv")
+end
+
+local function downloadVideo(index)
+    local url = getMovieURL(index)
+    local localFile = "/current_video.nfv"
+    shell.run("wget", url, localFile)
+    return fs.exists(localFile) and localFile or nil
+end
+
+local function loadVideo(videoFile)
+    local videoData = {}
+    for line in io.lines(videoFile) do
+        table.insert(videoData, line)
+    end
+    local resolution = { videoData[1]:match("(%d+) (%d+)") }
+    table.remove(videoData, 1) -- Remove resolution header
+    return videoData, resolution
+end
+
+local function convertHexFrameToSurface(frameData, width, height)
+    local surf = surface.create(width, height, " ", colors.black, colors.black)
+    for y, line in ipairs(frameData) do
+        for x = 1, #line do
+            local hex = tonumber(line:sub(x, x), 16)
+            local color = 2 ^ hex
+            surf.buffer[((y - 1) * width + x) * 3 - 1] = color -- Foreground
+            surf.buffer[((y - 1) * width + x) * 3] = color     -- Background
+        end
+    end
+    return surf
+end
+
+local function playVideo(videoFile, videoIndex, startTime)
+    local videoData, resolution = loadVideo(videoFile)
+    local totalFrames = math.floor(#videoData / resolution[2])
+    local frameIndex = (videoIndex == 1) and 1401 or 1
+    local videoStartTime = os.epoch("utc") - startTime
+
+    local surf = surface.create(resolution[1], resolution[2], " ", colors.black, colors.black)
+    while frameIndex <= totalFrames do
+        local bytePosition = tapeDrive.getPosition()
+        local elapsedTime = os.epoch("utc") - videoStartTime
+        local expectedFrame = math.floor(bytePosition / bytesPerFrame) + 1
+
+        if expectedFrame > totalFrames then break end
+        frameIndex = expectedFrame
+
+        local frame = {}
+        for i = 1, resolution[2] do
+            if frameIndex * resolution[2] + i - resolution[2] > #videoData then break end
+            table.insert(frame, videoData[frameIndex * resolution[2] + i - resolution[2]])
+        end
+
+        surf = convertHexFrameToSurface(frame, resolution[1], resolution[2])
+        surf:render()
+
+        local frameTimestamp = startTime + ((frameIndex - 1) * 200)
+        local sleepTime = (frameTimestamp - os.epoch("utc")) / 1000
+        if sleepTime > 0 then os.sleep(sleepTime) end
+
+        os.queueEvent("frame")
+        os.pullEvent("frame")
+    end
+end
+
+local function correctTapeInserted(movieName)
+    if tapeDrive and tapeDrive.getLabel then
+        local label = tapeDrive.getLabel()
+        return label and label:lower() == movieName:lower()
+    end
+    return false
+end
+
+local function insertTape(movieName)
+    if not tapeDrive then return false end
+    if correctTapeInserted(movieName) then return true end
+
+    local items = chest.list()
+    for slot, item in pairs(items) do
+        if item.name == "computronics:tape" then
+            chest.pushItems(peripheral.getName(tapeDrive), slot, 1)
+            os.sleep(1)
+            if correctTapeInserted(movieName) then return true end
+            tapeDrive.eject()
+            os.sleep(1)
+        end
+    end
+    return false
+end
+
+local function rewindTape()
+    if tapeDrive and tapeDrive.getSize and tapeDrive.getPosition then
+        if tapeDrive.getPosition() > 0 then
+            tapeDrive.seek(-tapeDrive.getSize())
+            os.sleep(2)
+        end
+    end
+end
+
+local function ejectTape()
+    if tapeDrive and tapeDrive.getLabel then
+        tapeDrive.eject()
+        os.sleep(1)
+    end
+end
+
+local function playMovie(movieName)
+    clearOldVideos()
+    local videoIndex = 1
+    local globalStartTime = os.epoch("utc")
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    if insertTape(movieName) then
+        rewindTape()
+        os.sleep(1)
+        tapeDrive.play()
+
+        while true do
+            local currentFile = downloadVideo(videoIndex)
+            if not currentFile then break end
+
+            local nextIndex = videoIndex + 1
+            local nextFile = "/next_video.nfv"
+            shell.run("wget", getMovieURL(nextIndex), nextFile, "&")
+
+            local videoDuration = (videoIndex == 1) and firstVideoDuration or otherVideoDuration
+            local videoStartTime = globalStartTime + ((videoIndex - 1) * videoDuration)
+
+            playVideo(currentFile, videoIndex, videoStartTime)
+            fs.delete(currentFile)
+
+            if fs.exists(nextFile) then
+                fs.move(nextFile, "/current_video.nfv")
+                videoIndex = nextIndex
+            else
+                break
+            end
+        end
+
+        tapeDrive.stop()
+        ejectTape()
+    end
+end
+
+monitor.setTextScale(1)
+term.redirect(monitor)
+modem.open(100)
+
+while true do
+    local _, _, _, _, message = os.pullEvent("modem_message")
+    if message:sub(1, 5) == "play_" then
+        local movieName = message:sub(6)
+        playMovie(movieName)
+    end
+end
